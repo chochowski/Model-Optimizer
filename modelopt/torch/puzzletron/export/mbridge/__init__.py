@@ -27,9 +27,12 @@ from modelopt.torch.puzzletron.export.mbridge.llama import (  # noqa: F401
 from modelopt.torch.puzzletron.export.mbridge.qwen3 import (  # noqa: F401
     PuzzletronQwen3AnyModelBridge,
 )
-
+from modelopt.torch.puzzletron.export.mbridge.gptoss import (  # noqa: F401
+    PuzzletronGptOssAnyModelBridge,
+)
 __all__ = [
     "HeterogeneousBridgeMixin",
     "PuzzletronLlamaAnyModelBridge",
     "PuzzletronQwen3AnyModelBridge",
+    "PuzzletronGptOssAnyModelBridge",
 ]

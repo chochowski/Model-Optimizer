@@ -24,7 +24,7 @@ This module provides a mixin class for converting models with block_configs
 import dataclasses
 import json
 from collections.abc import Callable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
@@ -42,22 +42,31 @@ def heterogeneous_layer_spec(config) -> ModuleSpec:
 
 @dataclass
 class GenericHeterogeneousProvider(GPTModelProvider, HeterogeneousTransformerConfig):
-    """Generic provider for AnyModel checkpoints with block_configs."""
+    """Generic provider for AnyModel checkpoints with block_configs.
+
+    Carries both base + heterogeneous fields and any model-specific fields from the
+    wrapped provider (e.g. GPT-OSS YARN, Mistral scale_factor) in extra_provider_params,
+    so getattr(provider, 'yarn_rotary_scaling_factor') etc. work.
+    """
 
     # Heterogeneous configuration fields
     heterogeneous_layers_config_path: str | None = None
     heterogeneous_layers_config_encoded_json: str = ""
     transformer_layer_spec: ModuleSpec | Callable = heterogeneous_layer_spec
 
-    def __getattr__(self, name: str):
-        """Handle missing attributes for OmegaConf compatibility.
+    # Model-specific fields not in GPTModelProvider / HeterogeneousTransformerConfig
+    # (e.g. yarn_rotary_scaling_factor, scale_factor, moe_*). Preserved from the
+    # wrapped provider and exposed via __getattr__.
+    extra_provider_params: dict = field(default_factory=dict)
 
-        Returns empty list for per_block_parameters if not yet initialized (before finalize()).
-        This allows OmegaConf to serialize/deserialize configs without errors. Actual usage
-        should call finalize() first to set per_block_parameters as a real attribute.
-        """
+    def __getattr__(self, name: str):
+        """Expose extra_provider_params as attributes; handle per_block_parameters."""
+        if name == "extra_provider_params":
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+        extra = object.__getattribute__(self, "extra_provider_params")
+        if name in extra:
+            return extra[name]
         if name == "per_block_parameters":
-            # Return existing attribute if set, otherwise [] for OmegaConf compatibility
             try:
                 return object.__getattribute__(self, name)
             except AttributeError:
@@ -69,48 +78,45 @@ class HeterogeneousBridgeMixin:
     """Mixin for bridges supporting heterogeneous layer architectures (block_configs).
 
     Must be used with multiple inheritance alongside a model-specific bridge.
-    Example: class PuzzletronLlamaAnyModelBridge(HeterogeneousBridgeMixin, LlamaBridge)
+    Use (ModelBridge, HeterogeneousBridgeMixin) and override provider_bridge to call
+    the model bridge first, then wrap_provider_with_heterogeneous.
+    Example: class PuzzletronLlamaAnyModelBridge(LlamaBridge, HeterogeneousBridgeMixin)
     """
+
+    def wrap_provider_with_heterogeneous(
+        self, provider: GPTModelProvider, hf_pretrained: PreTrainedCausalLM
+    ) -> GPTModelProvider:
+        """Wrap a GPTModelProvider with heterogeneous layer config (block_configs).
+
+        Use this after calling the model-specific bridge's provider_bridge() so that
+        provider_bridge is invoked first from the model bridge, then heterogeneous
+        wrapping is applied via this method.
+        """
+        provider_kwargs = dataclasses.asdict(provider)
+        valid_fields = {f.name for f in fields(GenericHeterogeneousProvider)}
+
+        # Split into: fields we set on GenericHeterogeneousProvider vs model-specific extra
+        known_kwargs = {k: v for k, v in provider_kwargs.items() if k in valid_fields}
+        extra_params = {k: v for k, v in provider_kwargs.items() if k not in valid_fields}
+
+        known_kwargs["heterogeneous_layers_config_encoded_json"] = (
+            self._build_heterogeneous_config_json(hf_pretrained.config)
+        )
+        known_kwargs["transformer_layer_spec"] = heterogeneous_layer_spec
+
+        known_kwargs["extra_provider_params"] = extra_params
+        return GenericHeterogeneousProvider(**known_kwargs)
 
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> GPTModelProvider:
         """Convert HF AnyModel config to Megatron GPTModelProvider.
 
-        This method:
-        1. Calls the parent bridge's provider_bridge() to get a GPTModelProvider with all
-           model-specific settings (e.g., LlamaBridge sets normalization="RMSNorm", etc.)
-        2. Converts the provider to a dict and filters to only fields accepted by
-           GenericHeterogeneousProvider (which inherits from GPTModelProvider, so all valid
-           GPTModelProvider fields are preserved)
-        3. Adds heterogeneous configuration and returns GenericHeterogeneousProvider
-
-        All parameters from the parent bridge (e.g., LlamaBridge) are maintained because
-        GenericHeterogeneousProvider inherits from GPTModelProvider, which includes all
-        the fields that the parent bridge sets.
+        Calls the parent bridge's provider_bridge() first, then wraps with heterogeneous
+        config via wrap_provider_with_heterogeneous(). Subclasses that list the model
+        bridge first in the base order should override this to call super().provider_bridge()
+        then wrap_provider_with_heterogeneous() so the model bridge is invoked first.
         """
-
         parent_provider = super().provider_bridge(hf_pretrained)  # type: ignore[misc]
-
-        provider_kwargs = dataclasses.asdict(parent_provider)
-
-        # Filter to only fields that GenericHeterogeneousProvider accepts.
-        # GenericHeterogeneousProvider inherits from GPTModelProvider, so it includes all
-        # GPTModelProvider fields. Model-specific fields from subclasses (e.g., MistralModelProvider,
-        # GPTOSSModelProvider) are filtered out because GenericHeterogeneousProvider only inherits
-        # from GPTModelProvider, not from model-specific subclasses.
-        #
-        # Note: This logic may not work for bridges like MistralBridge or GPTOSSBridge if they
-        # use model-specific parameters not supported by GenericHeterogeneousProvider (e.g.,
-        # scale_factor, yarn_rotary_scaling_factor, moe_* parameters). In such cases, create a
-        # model-specific heterogeneous provider that inherits from the model-specific provider.
-        valid_fields = {f.name for f in fields(GenericHeterogeneousProvider)}
-
-        # Only keep kwargs that are valid fields
-        provider_kwargs = {k: v for k, v in provider_kwargs.items() if k in valid_fields}
-
-        provider_kwargs["heterogeneous_layers_config_encoded_json"] = (
-            self._build_heterogeneous_config_json(hf_pretrained.config)
-        )
-        return GenericHeterogeneousProvider(**provider_kwargs)
+        return self.wrap_provider_with_heterogeneous(parent_provider, hf_pretrained)
 
     @classmethod
     def megatron_to_hf_config(cls, provider: GPTModelProvider) -> dict:
